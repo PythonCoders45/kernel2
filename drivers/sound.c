@@ -297,3 +297,35 @@ void sound_stop_all_voices(void) {
         audio_ctx.voices[i].active = 0;
     }
 }
+
+// High-level integration inside sound.c
+int sound_play_file_from_disk(const char* filename, uint8_t* work_buffer) {
+    // 1. Fetch file from storage
+    if (storage_load_file_to_ram(filename, work_buffer) != 0) {
+        return -1; // File not found on disk
+    }
+
+    // 2. Initialize the bitstream for the codec
+    BitStream stream;
+    // (Assuming file size is known from the file entry)
+    bitstream_init(&stream, work_buffer, 4096); 
+
+    // 3. Decode compressed chunks and stream to hardware
+    int16_t pcm_output_block[512];
+    int32_t frequency_spectrum[256];
+
+    // Decode loop example
+    for (int i = 0; i < 256; i++) {
+        frequency_spectrum[i] = huffman_decode_symbol(&stream, my_huffman_tree, 0) * 64;
+    }
+
+    // Convert frequency domain to time domain PCM via MDCT
+    audio_compute_mdct(frequency_spectrum, pcm_output_block, 512);
+
+    // 4. Play the decoded samples through the hardware speaker/output
+    for (int i = 0; i < 512; i++) {
+        sound_hw_write_sample(pcm_output_block[i]);
+    }
+
+    return 0;
+}
