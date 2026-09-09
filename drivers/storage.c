@@ -1,6 +1,6 @@
 /* ==========================================================================
- * OS Storage Subsystem - Direct ATA/IDE Sector Driver
- * Communicates directly with storage controllers via port I/O
+ * OS Storage & File Subsystem - Advanced High-Performance ATA Driver
+ * Features: 32-bit Fast-Block Transfers, Directory Caching, and FFS Management
  * ========================================================================== */
 
 #include "../include/types.h"
@@ -26,8 +26,29 @@
 #define ATA_SR_DRDY              0x40    // Drive ready
 #define ATA_SR_DRQ               0x08    // Data request ready
 
+// File System & Caching Constants
+#define MAX_FILES_IN_DIR         64
+#define SECTOR_SIZE              512
+
+// File Directory Entry Structure (Stored in Sector 1)
+typedef struct {
+    char     filename[32];       // Null-terminated file name
+    uint32_t starting_lba;   // Starting disk sector
+    uint32_t file_size;      // Size in bytes
+    uint8_t  is_valid;       // 1 if file exists, 0 if empty slot
+} __attribute__((packed)) FileEntry;
+
+typedef struct {
+    uint32_t total_files;
+    FileEntry entries[MAX_FILES_IN_DIR];
+} __attribute__((packed)) DirectoryTable;
+
+// Internal cache state to avoid redundant disk reads for directory lookups
+static DirectoryTable cached_directory;
+static uint8_t directory_cache_loaded = 0;
+
 /* ==========================================================================
- * 1. LOW-LEVEL PORT I/O HELPERS
+ * 1. HIGH-SPEED ARCHITECTURE-SPECIFIC I/O HELPERS
  * ========================================================================== */
 
 #if defined(__i386__) || defined(__x86_64__)
@@ -41,43 +62,37 @@ static inline uint8_t storage_inb(uint16_t port) {
     return ret;
 }
 
-static inline void storage_insw(uint16_t port, void* addr, uint32_t word_count) {
-    __asm__ volatile ("rep insw" : "+D"(addr), "+c"(word_count) : "d"(port) : "memory");
+// Blazing fast 32-bit double-word block transfer (moves 4 bytes per iteration)
+static inline void storage_insd(uint16_t port, void* addr, uint32_t dword_count) {
+    __asm__ volatile ("rep insd" : "+D"(addr), "+c"(dword_count) : "d"(port) : "memory");
 }
 
-static inline void storage_outsw(uint16_t port, const void* addr, uint32_t word_count) {
-    __asm__ volatile ("rep outsw" : "+S"(addr), "+c"(word_count) : "d"(port) : "memory");
+static inline void storage_outsd(uint16_t port, const void* addr, uint32_t dword_count) {
+    __asm__ volatile ("rep outsd" : "+S"(addr), "+c"(dword_count) : "d"(port) : "memory");
 }
 #endif
 
 /* ==========================================================================
- * 2. STORAGE CONTROLLER INITIALIZATION
+ * 2. STORAGE CONTROLLER INITIALIZATION & POLLING
  * ========================================================================== */
 
 void storage_init(void) {
-    // Select primary drive and wait for it to be ready
 #if defined(__i386__) || defined(__x86_64__)
     storage_outb(ATA_PRIMARY_DRIVE_HEAD, 0xA0); // Select master drive, LBA mode
-    
-    // Small delay for drive stabilization
     for (volatile int i = 0; i < 10000; i++);
+    directory_cache_loaded = 0;
 #endif
 }
 
-/* ==========================================================================
- * 3. POLLING & STATUS CHECKS
- * ========================================================================== */
-
 static int storage_poll(void) {
 #if defined(__i386__) || defined(__x86_64__)
-    // Wait for BSY to clear and DRQ to set
     for (int timeout = 0; timeout < 100000; timeout++) {
         uint8_t status = storage_inb(ATA_PRIMARY_STATUS);
         if (!(status & ATA_SR_BSY) && (status & ATA_SR_DRQ)) {
             return 0; // Ready
         }
-        if (status & 0x01) { // ERR bit set
-            return -1;
+        if (status & 0x01) {
+            return -1; // Hardware error bit set
         }
     }
 #endif
@@ -85,58 +100,110 @@ static int storage_poll(void) {
 }
 
 /* ==========================================================================
- * 4. READ & WRITE SECTOR OPERATIONS (512 Bytes per Sector)
+ * 3. OPTIMIZED SECTOR READ/WRITE ROUTINES
  * ========================================================================== */
 
-// Read a 512-byte sector from storage into a memory buffer using LBA
 int storage_read_sector(uint32_t lba, uint8_t* target_buffer) {
 #if defined(__i386__) || defined(__x86_64__)
-    storage_outb(ATA_PRIMARY_SEC_COUNT, 1);                    // Read 1 sector
-    storage_outb(ATA_PRIMARY_LBA_LOW, (uint8_t)(lba));         // LBA bits 0-7
-    storage_outb(ATA_PRIMARY_LBA_MID, (uint8_t)(lba >> 8));    // LBA bits 8-15
-    storage_outb(ATA_PRIMARY_LBA_HIGH, (uint8_t)(lba >> 16));   // LBA bits 16-23
-    storage_outb(ATA_PRIMARY_DRIVE_HEAD, 0xE0 | ((lba >> 24) & 0x0F)); // Master + LBA bits 24-27
-    storage_outb(ATA_PRIMARY_COMMAND, ATA_CMD_READ_PIO);       // Issue read command
-
-    if (storage_poll() != 0) {
-        return -1; // Read error or timeout
-    }
-
-    // Transfer 256 words (512 bytes) directly from data port into RAM buffer
-    storage_insw(ATA_PRIMARY_DATA, target_buffer, 256);
-    return 0;
-#else
-    (void)lba;
-    (void)target_buffer;
-    return -1;
-#endif
-}
-
-// Write a 512-byte sector from a memory buffer directly to storage
-int storage_write_sector(uint32_t lba, const uint8_t* source_buffer) {
-#if defined(__i386__) || defined(__x86_64__)
-    storage_outb(ATA_PRIMARY_SEC_COUNT, 1);                    // Write 1 sector
+    storage_outb(ATA_PRIMARY_SEC_COUNT, 1);
     storage_outb(ATA_PRIMARY_LBA_LOW, (uint8_t)(lba));
     storage_outb(ATA_PRIMARY_LBA_MID, (uint8_t)(lba >> 8));
     storage_outb(ATA_PRIMARY_LBA_HIGH, (uint8_t)(lba >> 16));
     storage_outb(ATA_PRIMARY_DRIVE_HEAD, 0xE0 | ((lba >> 24) & 0x0F));
-    storage_outb(ATA_PRIMARY_COMMAND, ATA_CMD_WRITE_PIO);      // Issue write command
+    storage_outb(ATA_PRIMARY_COMMAND, ATA_CMD_READ_PIO);
 
-    if (storage_poll() != 0) {
-        return -1;
-    }
+    if (storage_poll() != 0) return -1;
 
-    // Transfer 256 words (512 bytes) from RAM buffer into hardware data port
-    storage_outsw(ATA_PRIMARY_DATA, source_buffer, 256);
-
-    // Flush drive cache to ensure data is permanently written
-    storage_outb(ATA_PRIMARY_COMMAND, ATA_CMD_CACHE_FLUSH);
-    storage_poll();
-
+    // Read 512 bytes using 128 double-words (32-bit blocks) for maximum throughput
+    storage_insd(ATA_PRIMARY_DATA, target_buffer, 128);
     return 0;
 #else
-    (void)lba;
-    (void)source_buffer;
+    (void)lba; (void)target_buffer;
     return -1;
 #endif
+}
+
+int storage_write_sector(uint32_t lba, const uint8_t* source_buffer) {
+#if defined(__i386__) || defined(__x86_64__)
+    storage_outb(ATA_PRIMARY_SEC_COUNT, 1);
+    storage_outb(ATA_PRIMARY_LBA_LOW, (uint8_t)(lba));
+    storage_outb(ATA_PRIMARY_LBA_MID, (uint8_t)(lba >> 8));
+    storage_outb(ATA_PRIMARY_LBA_HIGH, (uint8_t)(lba >> 16));
+    storage_outb(ATA_PRIMARY_DRIVE_HEAD, 0xE0 | ((lba >> 24) & 0x0F));
+    storage_outb(ATA_PRIMARY_COMMAND, ATA_CMD_WRITE_PIO);
+
+    if (storage_poll() != 0) return -1;
+
+    // Write 512 bytes using 32-bit double-word blocks
+    storage_outsd(ATA_PRIMARY_DATA, source_buffer, 128);
+
+    storage_outb(ATA_PRIMARY_COMMAND, ATA_CMD_CACHE_FLUSH);
+    storage_poll();
+    return 0;
+#else
+    (void)lba; (void)source_buffer;
+    return -1;
+#endif
+}
+
+/* ==========================================================================
+ * 4. ADVANCED FILE SYSTEM & DIRECTORY CACHING LAYER
+ * ========================================================================== */
+
+static int storage_strcmp(const char* s1, const char* s2) {
+    while (*s1 && (*s1 == *s2)) {
+        s1++;
+        s2++;
+    }
+    return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+}
+
+// Refresh or load the directory table into high-speed RAM cache
+int storage_refresh_directory_cache(void) {
+    if (storage_read_sector(1, (uint8_t*)&cached_directory) != 0) {
+        return -1;
+    }
+    directory_cache_loaded = 1;
+    return 0;
+}
+
+// Find a file instantly using the in-RAM directory cache
+int storage_find_file(const char* filename, FileEntry* out_entry) {
+    if (!directory_cache_loaded) {
+        if (storage_refresh_directory_cache() != 0) {
+            return -1;
+        }
+    }
+
+    for (uint32_t i = 0; i < MAX_FILES_IN_DIR; i++) {
+        if (cached_directory.entries[i].is_valid) {
+            if (storage_strcmp(cached_directory.entries[i].filename, filename) == 0) {
+                *out_entry = cached_directory.entries[i];
+                return 0;
+            }
+        }
+    }
+
+    return -1; // File not found
+}
+
+// High-speed multi-sector file loader into system RAM
+int storage_load_file_to_ram(const char* filename, uint8_t* ram_destination) {
+    FileEntry file;
+    if (storage_find_file(filename, &file) != 0) {
+        return -1; 
+    }
+
+    uint32_t sectors_to_read = (file.file_size + SECTOR_SIZE - 1) / SECTOR_SIZE;
+
+    for (uint32_t i = 0; i < sectors_to_read; i++) {
+        uint32_t target_lba = file.starting_lba + i;
+        uint8_t* dest_ptr = ram_destination + (i * SECTOR_SIZE);
+        
+        if (storage_read_sector(target_lba, dest_ptr) != 0) {
+            return -1; 
+        }
+    }
+
+    return 0; 
 }
