@@ -1,6 +1,6 @@
 CC = gcc
 AS = as
-CFLAGS = -ffreestanding -O2 -Wall -Wextra
+CFLAGS = -ffreestanding -O2 -Wall -Wextra -fmax-errors=0
 LDFLAGS = -T linker.ld -nostdlib
 
 # List all your project object files
